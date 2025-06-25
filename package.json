@@ -2,14 +2,19 @@
 {
   "name": "telegram-bot-vercel-universal-ai",
   "version": "1.1.0",
+  "type": "commonjs",
   "main": "api/bot.js",
-  "scripts": {"start": "vercel dev"},
+  "scripts": {
+    "start": "vercel dev"
+  },
   "dependencies": {
-    "telegraf": "^4.12.2",
     "axios": "^1.4.0",
     "node-fetch": "^2.6.7",
     "openai": "^4.5.0",
-    "tesseract.js": "^2.1.5"
+    "tesseract.js": "^2.1.5",
+    "telegraf": "^4.12.2"
+  },
+  "engines": {
+    "node": ">=14"
   }
 }
-
