@@ -1,53 +1,56 @@
+// api/bot.js
+require('dotenv').config();
 const { Telegraf, Markup, session } = require('telegraf');
 const axios = require('axios');
 const fetch = require('node-fetch');
 const Tesseract = require('tesseract.js');
 const { Configuration, OpenAIApi } = require('openai');
 
-// Guard env vars
-if (!process.env.BOT_TOKEN) throw new Error('❌ BOT_TOKEN is not set');
-if (!process.env.OPENAI_API_KEY) throw new Error('❌ OPENAI_API_KEY is not set');
+// ─── ENV CHECK ────────────────────────────────────────────────────────────────
+['BOT_TOKEN','OPENAI_API_KEY'].forEach(k => {
+  if (!process.env[k]) throw new Error(`${k} not set in environment`);
+});
 
-// Initialize bot & OpenAI
+// ─── INIT BOT & OPENAI ────────────────────────────────────────────────────────
 const bot = new Telegraf(process.env.BOT_TOKEN);
 bot.use(session());
 const openai = new OpenAIApi(new Configuration({ apiKey: process.env.OPENAI_API_KEY }));
 
-// Global error handling
-bot.catch((err, ctx) => console.error('🚨 Bot error', err, 'Update:', ctx.update));
-process.on('unhandledRejection', err => console.error('🚨 Unhandled Rejection', err));
-process.on('uncaughtException', err => console.error('🚨 Uncaught Exception', err));
+// ─── GLOBAL ERROR HANDLERS ────────────────────────────────────────────────────
+bot.catch((err, ctx) => console.error('Unhandled bot error', err));
+process.on('unhandledRejection', console.error);
+process.on('uncaughtException', console.error);
 
-// Simple logging middleware
+// ─── FLOOD CONTROL ────────────────────────────────────────────────────────────
+const flood = {};
 bot.use((ctx, next) => {
-  console.log('🔔 Update:', ctx.updateType);
+  const cid = ctx.chat.id, uid = ctx.from.id;
+  flood[cid] = flood[cid]||{};
+  flood[cid][uid] = (flood[cid][uid]||[]).concat(Date.now());
+  flood[cid][uid] = flood[cid][uid].filter(ts => Date.now()-ts < 20_000);
+  if (flood[cid][uid].length > 15) return ctx.deleteMessage().catch(()=>{});
   return next();
 });
 
-// Flood control
-typeof flood === 'undefined' && (global.flood = {});
-bot.use((ctx, next) => {
-  if (ctx.chat && ctx.from) {
-    const cid = ctx.chat.id, uid = ctx.from.id;
-    global.flood[cid] = global.flood[cid] || {};
-    global.flood[cid][uid] = global.flood[cid][uid] || [];
-    global.flood[cid][uid].push(Date.now());
-    global.flood[cid][uid] = global.flood[cid][uid].filter(ts => Date.now() - ts < 20000);
-    if (global.flood[cid][uid].length > 15) {
-      return ctx.deleteMessage().catch(() => {});
-    }
-  }
-  return next();
-});
-
-// Helpers
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
 async function getAnimeImage() {
   try {
     const res = await axios.get('https://api.waifu.pics/sfw/waifu');
     return res.data.url;
   } catch (e) {
-    console.error('Anime API error', e);
-    return 'https://via.placeholder.com/500?text=Error';
+    console.error('Waifu API error', e);
+    return 'https://via.placeholder.com/500?text=Anime+Error';
+  }
+}
+
+async function getMeme() {
+  try {
+    const { data } = await axios.get('https://meme-api.com/gimme');
+    if (data.nsfw || data.spoiler) throw new Error('nsfw/spoiler');
+    return data;
+  } catch (e) {
+    console.error('Meme API error', e);
+    return { url: 'https://via.placeholder.com/500?text=No+Meme', title: 'No meme' };
   }
 }
 
@@ -61,16 +64,6 @@ async function getWeather(city) {
   }
 }
 
-async function getMeme() {
-  try {
-    const res = await axios.get('https://meme-api.com/gimme');
-    return res.data;
-  } catch (e) {
-    console.error('Meme API error', e);
-    return { url: 'https://via.placeholder.com/500?text=No+Meme', title: 'No meme' };
-  }
-}
-
 async function translateText(text) {
   try {
     const res = await fetch('https://de.libretranslate.com/translate', {
@@ -78,7 +71,7 @@ async function translateText(text) {
       body: JSON.stringify({
         q: text,
         source: 'auto',
-        target: 'id',
+        target: 'de',
         format: 'text',
         alternatives: 3,
         api_key: ''
@@ -91,43 +84,61 @@ async function translateText(text) {
     }
     return data.translatedText || JSON.stringify(data);
   } catch (e) {
-    console.error('Translate error', e);
+    console.error('Translate API error', e);
     return 'Error translate';
   }
 }
 
-// AI Assistant
-async function aiAssist(query) {
-  let liveData = '';
-  try { liveData += `Weather: ${await getWeather('Jakarta')}`; } catch (e) { console.error(e); }
+async function aiAssist(q) {
   try {
-    const btcData = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd');
-    liveData += ` | BTC: $${btcData.data.bitcoin.usd}`;
-  } catch (e) { console.error('Crypto API error', e); }
-  const prompt = `User: "${query}"
-Live data: ${liveData}
-Answer:`;
-  const resp = await openai.createCompletion({ model: 'text-davinci-003', prompt, max_tokens: 200 });
-  return resp.data.choices[0].text.trim();
+    const weather = await getWeather('Jakarta');
+    const crypto = await axios
+      .get('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd')
+      .then(r => `BTC $${r.data.bitcoin.usd}`)
+      .catch(()=>'');
+    const prompt = `User: "${q}"\nLive:\n- ${weather}\n- ${crypto}\nAnswer:`;
+    const resp = await openai.createCompletion({ model:'text-davinci-003', prompt, max_tokens:200 });
+    return resp.data.choices[0].text.trim();
+  } catch (e) {
+    console.error('AI Assist error', e);
+    return '🤖 Error AI';
+  }
 }
 
-// Summarize & Paraphrase
 async function summarizeText(text) {
-  const prompt = `Summarize this text in concise Indonesian:\n${text}`;
-  const res = await openai.createCompletion({ model: 'text-davinci-003', prompt, max_tokens: 150 });
-  return res.data.choices[0].text.trim();
-}
-async function paraphraseText(text) {
-  const prompt = `Paraphrase this text in Indonesian:\n${text}`;
-  const res = await openai.createCompletion({ model: 'text-davinci-003', prompt, max_tokens: 150 });
-  return res.data.choices[0].text.trim();
+  try {
+    const res = await openai.createCompletion({
+      model: 'text-davinci-003',
+      prompt: `Summarize this text in concise Indonesian:\n${text}`,
+      max_tokens: 150
+    });
+    return res.data.choices[0].text.trim();
+  } catch (e) {
+    console.error('Summarize error', e);
+    return 'Error ringkasan';
+  }
 }
 
-// Verification
+async function paraphraseText(text) {
+  try {
+    const res = await openai.createCompletion({
+      model: 'text-davinci-003',
+      prompt: `Paraphrase this text in Indonesian:\n${text}`,
+      max_tokens: 150
+    });
+    return res.data.choices[0].text.trim();
+  } catch (e) {
+    console.error('Paraphrase error', e);
+    return 'Error parafrase';
+  }
+}
+
+// ─── VERIFICATION & /start ────────────────────────────────────────────────────
 bot.start(ctx => {
   ctx.session.verified = false;
   ctx.session.todos = [];
-  return ctx.reply('🔒 Silakan verifikasi via kontak',
+  return ctx.reply(
+    '🔒 Verifikasi via kontak terlebih dahulu',
     Markup.keyboard([Markup.button.contactRequest('🔒 Verifikasi')]).oneTime().resize()
   );
 });
@@ -136,124 +147,115 @@ bot.on('contact', ctx => {
     ctx.session.verified = true;
     return ctx.reply('✅ Verifikasi berhasil.', Markup.removeKeyboard());
   }
-  return ctx.reply('⚠️ Silakan share kontak Anda sendiri.');
+  return ctx.reply('⚠️ Silakan bagikan kontak Anda sendiri.');
 });
 bot.use((ctx, next) => {
-  if (ctx.session.verified || ctx.updateType === 'contact' || ctx.message?.text === '/start') return next();
+  if (ctx.session.verified || ctx.updateType === 'contact' || ctx.message.text === '/start') {
+    return next();
+  }
   return ctx.reply('🔒 Verifikasi dulu dengan /start dan bagikan kontak.');
 });
 
-// Welcome & anti-spam in group
+// ─── WELCOME NEW MEMBERS ───────────────────────────────────────────────────────
 bot.on('new_chat_members', ctx => {
-  const names = ctx.message.new_chat_members.map(m => m.first_name).join(', ');
-  return ctx.reply(`Selamat datang, ${names}!`);
+  ctx.message.new_chat_members.forEach(mem =>
+    ctx.reply(`Selamat datang, ${mem.first_name}!`)
+  );
 });
 
-// Inline queries
+// ─── INLINE QUERIES ────────────────────────────────────────────────────────────
 bot.on('inline_query', async ctx => {
   const q = ctx.inlineQuery.query.toLowerCase();
   const results = [];
   if (q.includes('anime')) {
-    const url = await getAnimeImage();
-    results.push({ type: 'photo', id: '1', photo_url: url, thumb_url: url });
+    results.push({
+      type: 'photo',
+      id: '1',
+      photo_url: await getAnimeImage(),
+      thumb_url: await getAnimeImage()
+    });
   }
   if (q.startsWith('translate ')) {
     const tr = await translateText(q.slice(10));
-    results.push({ type: 'article', id: '2', title: 'Translate', input_message_content: { message_text: `🌐 ${tr}` } });
+    results.push({
+      type: 'article',
+      id: '2',
+      title: 'Translate',
+      input_message_content: { message_text: `🌐 ${tr}` }
+    });
   }
   if (!results.length) {
     const ans = await aiAssist(q);
-    results.push({ type: 'article', id: '3', title: 'AI', input_message_content: { message_text: ans } });
+    results.push({
+      type: 'article',
+      id: '3',
+      title: 'AI Reply',
+      input_message_content: { message_text: ans }
+    });
   }
   return ctx.answerInlineQuery(results);
 });
 
-// Main handler: OCR, commands & fallback
+// ─── MAIN HANDLER ───────────────────────────────────────────────────────────────
 bot.on(['photo','document','text'], async ctx => {
-  try {
-    // OCR
-    if (ctx.message.photo || (ctx.message.document && ctx.message.document.mime_type.startsWith('image/'))) {
-      await ctx.reply('🔍 OCR processing...');
-      const file = ctx.message.photo?.pop() || ctx.message.document;
+  // OCR
+  if (ctx.message.photo || (ctx.message.document && ctx.message.document.mime_type.startsWith('image/'))) {
+    try {
+      const file = ctx.message.photo ? ctx.message.photo.pop() : ctx.message.document;
       const link = await ctx.telegram.getFileLink(file.file_id);
+      await ctx.reply('🔍 OCR processing...');
       const { data: { text } } = await Tesseract.recognize(link.href, 'eng');
       return ctx.reply(`📄 Hasil OCR:\n${text}`);
+    } catch (e) {
+      console.error('OCR error', e);
+      return ctx.reply('⚠️ OCR gagal.');
     }
-    const txt = (ctx.message.text || '').trim();
-    const lower = txt.toLowerCase();
-
-    // To-Do
-    if (lower.startsWith('/todo')) {
-      const [ , cmd, ...rest ] = txt.split(' ');
-      const todos = ctx.session.todos;
-      if (cmd === 'add') {
-        todos.push(rest.join(' '));
-        return ctx.reply(`✅ Todo dibuat: ${rest.join(' ')}`);
-      }
-      if (cmd === 'list') {
-        return ctx.reply(todos.length ? todos.map((t,i) => `${i+1}. ${t}`).join('\n') : '📝 Todo kosong');
-      }
-      if (cmd === 'del') {
-        const idx = parseInt(rest[0], 10) - 1;
-        const rem = todos.splice(idx, 1);
-        return ctx.reply(`❌ Dihapus: ${rem}`);
-      }
-      return ctx.reply('Usage: /todo add <task> | list | del <index>');
-    }
-
-    // Summarize & Paraphrase
-    if (lower.startsWith('/summarize ')) {
-      const res = await summarizeText(txt.slice(11));
-      return ctx.reply(`📝 Ringkasan:\n${res}`);
-    }
-    if (lower.startsWith('/paraphrase ')) {
-      const res = await paraphraseText(txt.slice(12));
-      return ctx.reply(`✍️ Parafrase:\n${res}`);
-    }
-
-    // Keyword shortcuts
-    if (lower.includes('anime')) {
-      const url = await getAnimeImage();
-      return ctx.replyWithPhoto(url, { caption: '✨ Anime art!' });
-    }
-    if (lower.includes('meme')) {
-      const m = await getMeme();
-      return ctx.replyWithPhoto(m.url, { caption: m.title });
-    }
-    const wc = lower.match(/cuaca\s+(.+)/);
-    if (wc) return ctx.reply(await getWeather(wc[1].trim()));
-    const trm = lower.match(/translate\s+(.+)/);
-    if (trm) return ctx.reply(await translateText(trm[1]));
-    const rem = lower.match(/remind(?:er)?\s+(\d+)\s+(.+)/);
-    if (rem) {
-      setTimeout(() => ctx.reply(`⏰ ${rem[2]}`), parseInt(rem[1], 10) * 60000);
-      return ctx.reply('✅ Reminder disetel');
-    }
-
-    // Fallback AI
-    const ai = await aiAssist(txt);
-    return ctx.reply(`🤖 ${ai}`);
-  } catch (e) {
-    console.error('Error pada main handler:', e);
-    return ctx.reply('⚠️ Maaf, terjadi kesalahan.');
   }
+
+  const txt = (ctx.message.text || '').toLowerCase();
+
+  // To-Do
+  if (txt.startsWith('/todo')) {
+    const args = txt.split(' ').slice(1);
+    const list = ctx.session.todos;
+    if (args[0] === 'add')      return ctx.reply(`✅ Todo ditambahkan: ${args.slice(1).join(' ')}`)  && list.push(args.slice(1).join(' '));
+    if (args[0] === 'list')     return ctx.reply(list.length ? '📝 ' + list.map((t,i)=>`${i+1}. ${t}`).join('\n') : '📝 Todo kosong');
+    if (args[0] === 'del')      return ctx.reply(`❌ Dihapus: ${list.splice(+args[1]-1,1)}`);
+    return ctx.reply('Usage: /todo add|list|del');
+  }
+
+  // Summarize & Paraphrase
+  if (txt.startsWith('/summarize ')) {
+    const out = await summarizeText(ctx.message.text.slice(11));
+    return ctx.reply(`📝 Ringkasan:\n${out}`);
+  }
+  if (txt.startsWith('/paraphrase ')) {
+    const out = await paraphraseText(ctx.message.text.slice(12));
+    return ctx.reply(`✍️ Parafrase:\n${out}`);
+  }
+
+  // Keyword commands
+  if (txt.includes('anime'))      return ctx.replyWithPhoto(await getAnimeImage(), { caption: '✨ Anime!' });
+  if (txt.includes('meme'))       { const m = await getMeme(); return ctx.replyWithPhoto(m.url, { caption: m.title }); }
+  if (/cuaca\s+(.+)/.test(txt))   return ctx.reply(await getWeather(txt.match(/cuaca\s+(.+)/)[1].trim()));
+  if (/translate\s+(.+)/.test(txt)){ const tr = await translateText(txt.match(/translate\s+(.+)/)[1]); return ctx.reply(`🌐 ${tr}`); }
+  if (/remind(?:er)?\s+(\d+)\s+(.+)/.test(txt)) {
+    const [_,m, msg] = txt.match(/remind(?:er)?\s+(\d+)\s+(.+)/);
+    setTimeout(()=> ctx.reply(`⏰ ${msg}`), +m*60000);
+    return ctx.reply('✅ Reminder disetel');
+  }
+
+  // Fallback AI
+  const ai = await aiAssist(ctx.message.text);
+  return ctx.reply(`🤖 ${ai}`);
 });
 
-// Webhook auto-setup in production
-if (process.env.NODE_ENV === 'production') {
-  const url = process.env.VERCEL_URL;
-  if (url) {
-    bot.telegram.setWebhook(`https://${url}/api/bot`)
-      .then(() => console.log('✅ Webhook set to https://' + url + '/api/bot'))
-      .catch(console.error);
-  }
-}
-
-// Vercel handler
-module.exports = (req, res) => {
-  console.log('🔔 New request:', req.method, req.url);
+// ─── VERCEL HANDLER ────────────────────────────────────────────────────────────
+module.exports = async (req, res) => {
+  console.log('🔔 Got', req.method, req.url);
   if (req.method === 'POST') {
-    return bot.handleUpdate(req.body, res);
+    await bot.handleUpdate(req.body, res);
+  } else {
+    res.status(200).send('OK');
   }
-  res.status(200).send('OK');
 };
